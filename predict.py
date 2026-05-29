@@ -115,6 +115,46 @@ def save_outputs(out_dir: Path, stem: str, bgr: np.ndarray, result: dict,
                  result['vuvs'], rgb, result['vnormals'])
 
 
+def segment_human(bgr: np.ndarray, sam3_weights: str, device: torch.device) -> np.ndarray:
+    """SAM3 text prompt 分割人体，返回最近(最大面积)人体的bool mask (H,W)"""
+    import torch.nn.functional as F
+    from ultralytics.models.sam.build_sam3 import build_sam3_image_model
+
+    model = build_sam3_image_model(sam3_weights).to(device).eval().half()
+    h, w = bgr.shape[:2]
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    # 预处理
+    img = cv2.resize(rgb, (1008, 1008))
+    img_t = torch.tensor(img, dtype=torch.float16, device=device).permute(2, 0, 1)[None]
+    img_t = (img_t - 127.5) / 127.5
+
+    model.set_classes(text=["human"])
+    with torch.no_grad():
+        backbone_out = model.backbone.forward_image(img_t)
+        outputs = model.forward_grounding(
+            backbone_out=backbone_out,
+            text_ids=torch.arange(1, device=device, dtype=torch.long))
+
+    # 解析: 取置信度>0.3的mask中面积最大的(距镜头最近)
+    scores = (outputs['pred_logits'].sigmoid() *
+              outputs['presence_logit_dec'].sigmoid().unsqueeze(1)).squeeze(-1).flatten()
+    masks = outputs['pred_masks'].flatten(0, 1)
+    keep = scores > 0.3
+    if not keep.any():
+        print('[SAM3] 未检测到人体')
+        return np.zeros((h, w), dtype=bool)
+
+    masks_keep = F.interpolate(masks[keep].unsqueeze(1).float(), (h, w), mode='bilinear')[:, 0] > 0.5
+    best = masks_keep.sum(dim=(1, 2)).argmax()
+    mask = masks_keep[best].cpu().numpy()
+    print(f'[SAM3] 人体分割: score={scores[keep][best]:.3f}, area={mask.sum()} px')
+
+    del model
+    torch.cuda.empty_cache()
+    return mask
+
+
 @click.command()
 @click.option('-i', '--input', 'src', required=True, help='输入图片或视频路径')
 @click.option('-o', '--output', 'out_dir', default='./output', help='输出目录')
@@ -122,8 +162,11 @@ def save_outputs(out_dir: Path, stem: str, bgr: np.ndarray, result: dict,
 @click.option('-f', '--frames', default='0', help='视频帧索引, 逗号分隔 (如 "0,10,50"), -1表示最后一帧')
 @click.option('-t', '--threshold', default=0.02, type=float, help='去飞边阈值, 越小去除越多')
 @click.option('-r', '--resolution', default=9, type=int, help='分辨率级别 [0-9]')
+@click.option('--resize', type=str, default=None, help='输入缩放, 如 "360x640" (HxW)')
 @click.option('--fmt', default='ply,vis', help='输出格式: ply,glb,vis (逗号分隔)')
-def main(src, out_dir, weights, frames, threshold, resolution, fmt):
+@click.option('--human', 'sam3_weights', default=None, type=str,
+              help='启用SAM3人体分割, 传入sam3.pt路径')
+def main(src, out_dir, weights, frames, threshold, resolution, resize, fmt, sam3_weights):
     """MoGe 预测: 单目几何估计 + 去飞边 + 点云/Mesh导出"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     formats = set(fmt.split(','))
@@ -139,15 +182,51 @@ def main(src, out_dir, weights, frames, threshold, resolution, fmt):
     src_stem = Path(src).stem
 
     for idx, bgr in frame_list:
+        # resize
+        if resize:
+            rh, rw = [int(x) for x in resize.split('x')]
+            bgr = cv2.resize(bgr, (rw, rh))
+
         tag = f'{src_stem}_f{idx}'
         print(f'[推理] frame={idx}, shape={bgr.shape[:2]}')
         output = infer_single(model, bgr, device, resolution)
-        result = postprocess(output, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), threshold)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        result = postprocess(output, rgb, threshold)
         save_outputs(out_path, tag, bgr, result, formats)
 
         n_pts = result['verts'].shape[0]
         d_min, d_max = result['depth'][result['mask_clean']].min(), result['depth'][result['mask_clean']].max()
-        print(f'  -> {n_pts} 顶点, 深度 [{d_min:.2f}, {d_max:.2f}]m')
+        print(f'  -> 全局: {n_pts} 顶点, 深度 [{d_min:.2f}, {d_max:.2f}]m')
+
+        # SAM3 人体分割模式
+        if sam3_weights:
+            del model; torch.cuda.empty_cache()
+            human_mask = segment_human(bgr, sam3_weights, device)
+            # 保存mask
+            cv2.imwrite(str(out_path / f'{tag}_human_mask.png'),
+                        (human_mask * 255).astype(np.uint8))
+            # 人体点云: mask_clean & human_mask
+            mask_human = result['mask_clean'] & human_mask
+            h, w = output['depth'].shape
+            uv = utils3d.np.uv_map(h, w)
+            colors_f = rgb.astype(np.float32) / 255
+            normal = output.get('normal')
+            if normal is not None:
+                _, verts_h, vcolors_h, _, vnormals_h = utils3d.np.build_mesh_from_map(
+                    output['points'], colors_f, uv, normal, mask=mask_human, tri=True)
+            else:
+                _, verts_h, vcolors_h, _ = utils3d.np.build_mesh_from_map(
+                    output['points'], colors_f, uv, mask=mask_human, tri=True)
+                vnormals_h = None
+            verts_h *= [1, -1, -1]
+            if vnormals_h is not None:
+                vnormals_h *= [1, -1, -1]
+
+            save_ply(out_path / f'{tag}_human.ply', verts_h,
+                     np.zeros((0, 3), dtype=np.int32), vcolors_h, vnormals_h)
+            print(f'  -> 人体: {verts_h.shape[0]} 顶点')
+            # 重新加载MoGe用于后续帧
+            model = load_model(weights, device)
 
     print(f'[完成] 输出目录: {out_path}')
 

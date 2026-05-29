@@ -29,6 +29,8 @@ $UV_INSTALL torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 echo "[3/4] 安装依赖"
 $UV_INSTALL click opencv-python scipy matplotlib trimesh pillow huggingface_hub numpy -i "$PIP_INDEX"
+$UV_INSTALL ultralytics timm -i "$PIP_INDEX"
+$UV_INSTALL "git+https://github.com/ultralytics/CLIP.git"
 $UV_INSTALL "git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183"
 $UV_INSTALL "git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6"
 
